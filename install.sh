@@ -11,7 +11,7 @@ if [ "$(id -u)" = "0" ]; then
     exit 1
 fi
 
-result_folder=~/printer_data/config/adxl_results/chopper_magnitude
+result_folder=~/printer_data/config/chopper_magnitude
 if [ ! -d "$result_folder" ]; then # Check folder chopper_magnitude & create
     mkdir -p "$result_folder"
     # echo "Make $result_folder direction successfully complete"

@@ -49,7 +49,9 @@ DEFAULT_ACCEL_CHIP = "adxl345"
 RESULTS_FOLDER = os.path.expanduser("~/printer_data/config/chopper_magnitude")
 DATA_FOLDER = os.path.expanduser("~/printer_data/config/chopper_magnitude/tmp")
 
-FCLK = 12  # MHz
+# The internal clock of the drivers in MHz, same as the values used by Klipper.
+DRIVER_FCLK = {"2130": 13.2, "2240": 12.5}
+DEFAULT_FCLK = 12
 CUTOFF_RANGE = 5
 # Graphs generation
 COLORS = [
@@ -75,6 +77,81 @@ DEFAULT_REGISTER_VALUES = {
     "HSTRT_HEND_MAX": 16,
     "TPFD": (0, 15),
 }
+
+# Comparator blank time in clocks per TBL value. TMC2208/TMC2209 datasheet:
+# 16, 24, 32, 40. TMC5160 datasheet (and the other supported drivers): 16, 24,
+# 36, 54.
+TBL_CLOCKS = {"2208": (16, 24, 32, 40), "2209": (16, 24, 32, 40)}
+DEFAULT_TBL_CLOCKS = (16, 24, 36, 54)
+
+# The datasheets recommend a 16-30 kHz chopper frequency and calculate the
+# starting TOFF for 25 kHz, assuming that the two slow decay phases take 50% of
+# the chopper cycle. The real frequency also depends on the motor and the
+# hysteresis.
+CHOPPER_FREQ_TARGET = 25_000  # Hz
+# The datasheets recommend 16-30 kHz, but the lower end of that range can be
+# audible: a chopper whine at standstill was heard at an estimated 19.7 kHz and
+# not at 25 kHz. An accelerometer can't sense it, so the minimum frequency is a
+# hard limit, which can be changed with `min_chopper_frequency`.
+DEFAULT_MIN_CHOPPER_FREQ = 22  # kHz
+# Slightly over the recommended 30 kHz, as the frequency is only an estimate.
+MAX_CHOPPER_FREQ = 35_000  # Hz
+SLOW_DECAY_DUTY = 0.5
+
+# Blank time recommended by the datasheets for most applications.
+RECOMMENDED_TBL = (1, 2)
+DEFAULT_TBL = 2
+# "choosing a low to medium default value for the hysteresis (for example,
+# effective hysteresis = 4) normally fits most applications."
+DEFAULT_EFFECTIVE_HYSTERESIS = 4
+# HSTRT adds (register + 1) and HEND adds (register - 3), so the effective
+# hysteresis start value is: HSTRT + HEND - 2
+HYSTERESIS_REGISTER_OFFSET = 2
+# Stop an ascending sweep after this many samples without a real improvement.
+PROGRESSIVE_PATIENCE = 3
+
+# Indices of the parameters in the list passed to the objective function.
+PARAM_TBL = 1
+PARAM_TOFF = 2
+PARAM_HSTRT = 3
+PARAM_HEND = 4
+PARAM_TPFD = 5
+
+
+def pick_preferred(
+    scores: dict[int, float],
+    preference: list[int],
+    tolerance: float,
+    reference: float = float("inf"),
+) -> None | int:
+    """Pick the most preferred candidate that is close enough to the lowest score.
+
+    An accelerometer can not sense the audible chopper noise caused by a low
+    chopper frequency or a too high hysteresis. So, the lowest vibration alone
+    doesn't give the quietest values, and among the candidates that have similar
+    vibrations the one that the datasheet favors should be used.
+
+    Args:
+        scores (dict[int, float]): The measured score of each candidate.
+        preference (list[int]): The candidates from most to least preferred.
+        tolerance (float): How much higher than the lowest score a candidate can
+            be, as a ratio.
+        reference (float): The lowest score seen outside of these candidates.
+            Using it prevents the small differences allowed by the tolerance
+            from adding up over successive sweeps.
+
+    Returns:
+        None | int: The picked candidate, or None if no candidate is valid.
+    """
+    valid = {key: score for key, score in scores.items() if score != float("inf")}
+    if not valid:
+        return None
+    lowest_key = min(valid, key=valid.get)
+    limit = min(valid[lowest_key], reference) * (1 + tolerance)
+    for key in preference:
+        if key in valid and valid[key] <= limit:
+            return key
+    return lowest_key
 
 
 class MeasurementMode(IntEnum):
@@ -510,7 +587,14 @@ class ChopperTune:
         self.measure_time = config.getint("measure_time", 1250)
         self.required_rpm = config.getfloatlist("required_rpm", [37.5, 150, 1.5])
         self.delay = config.getfloat("delay", 500)
-        self.fclk = config.getint("fclk", 12)
+        self.fclk = config.getfloat("fclk", None)
+        self.plateau_tolerance = config.getfloat("plateau_tolerance", 0.05)
+        self.min_chopper_frequency = (
+            config.getfloat(
+                "min_chopper_frequency", DEFAULT_MIN_CHOPPER_FREQ, minval=0.0
+            )
+            * 1000
+        )
 
         self.kinematics = config.getsection("printer").get("kinematics")
 
@@ -519,11 +603,16 @@ class ChopperTune:
         self.resistor = None
         self.samples = {}  # store all samples
         self.total_expected_samples = -1  # the expected number of samples
+        # whether total_expected_samples is the upper limit, not an estimate
+        self.total_expected_samples_is_max = False
         self.number_of_samples = 0  # current number of samples taken
         self.number_of_real_samples = 0  # current number of real samples taken
         self.best_result = 999_999_999  # store the best result
         self.speed_vs_vibrations = []  # store speed vs vibrations
         self.global_start_time = 0  # store the global start time
+        self.raw_folder = None  # where the raw samples are saved, if requested
+        # whether the TOFF range was given by the user, if so all of it is tested
+        self.toff_range_requested = False
 
         # Calculated values
         self.search_method = None
@@ -745,9 +834,53 @@ class ChopperTune:
 
         return tpfd_min, tpfd_max
 
+    def validate_toff_values(self, toff_min: int, toff_max: int) -> tuple[int, int]:
+        """Validate the TOFF min and max values.
+
+        TOFF=0 disables the driver and the motor would free-wheel during the move.
+
+        Args:
+            toff_min (int): The TOFF min value.
+            toff_max (int): The TOFF max value.
+
+        Returns:
+            tuple[int, int]: Validated toff_min and toff_max values.
+        """
+        toff_min = max(toff_min, 1)
+        return toff_min, max(toff_max, toff_min)
+
+    def validate_chopper_mode(self, axes: list[str], steppers: list[str]) -> None:
+        """Check if the driver will use SpreadCycle at the measurement speed.
+
+        TBL, HSTRT, HEND and TPFD have no effect in StealthChop, so the results of
+        a tuning done in StealthChop would be meaningless.
+
+        Args:
+            axes (list[str]): The main and secondary axis.
+            steppers (list[str]): The main and secondary stepper.
+
+        Raises:
+            CommandError: If the driver is in StealthChop at the measurement speed.
+        """
+        threshold = self.driver_settings[steppers[0]].get("stealthchop_threshold")
+        if not threshold:
+            return
+        stepper_speed = self.min_speed
+        if self.kinematics == "corexy" and axes[0] != "z":
+            # The measurement moves are done on the diagonals.
+            stepper_speed *= 2**0.5
+        if stepper_speed < threshold:
+            raise self.printer.command_error(
+                f"WARNING!!! {steppers[0]} will be in StealthChop at "
+                f"{stepper_speed:.1f} mm/s (stealthchop_threshold: {threshold}), "
+                "chopper parameters have no effect in that mode. Please remove or "
+                "lower stealthchop_threshold in printer.cfg"
+            )
+
     def reset_sample_data(self) -> None:
         """Reset sample data."""
         self.total_expected_samples = -1
+        self.total_expected_samples_is_max = False
         self.number_of_samples = 0
         self.number_of_real_samples = 0
         self.best_result = 999_999_999
@@ -802,7 +935,8 @@ class ChopperTune:
             if field.lower() == "curr":
                 if self.registers[field.lower()] != value:
                     self.gcode.run_script_from_command(
-                        f"SET_TMC_CURRENT STEPPER={stepper} CURRENT={value / 1000}"
+                        f"SET_TMC_CURRENT STEPPER={stepper}{stepper_index} "
+                        f"CURRENT={value / 1000}"
                     )
             elif (
                 not (field == "tpfd" and self.driver not in DRIVERS_SUPPORTING_TPFD)
@@ -870,7 +1004,7 @@ class ChopperTune:
             tuple[int, int]: The minimum and maximum current values.
         """
         # Select run_current
-        run_current = int(
+        run_current = round(
             float(self.driver_settings[steppers[0]].get("run_current")) * 1000
         )
         if current_min is None:
@@ -1247,8 +1381,22 @@ class ChopperTune:
         self.number_of_real_samples += 1
         return accelerometer_measurement.samples
 
+    def get_fclk(self) -> float:
+        """Return the driver clock, preferring the value set in the config.
+
+        Returns:
+            float: The driver clock in MHz.
+        """
+        if self.fclk is not None:
+            return self.fclk
+        return DRIVER_FCLK.get(self.driver, DEFAULT_FCLK)
+
     def calculate_frequency(self, tbl: int, toff: int) -> float:
-        """Calculate frequency based on TBL and TOFF values.
+        """Calculate the upper limit of the chopper frequency.
+
+        As per the datasheets, the two slow decay phases and the two blank times
+        per chopper cycle put an upper limit to the chopper frequency. The actual
+        frequency is lower, as it also includes the on and fast decay phases.
 
         Args:
             tbl (int): The TBL value.
@@ -1257,10 +1405,20 @@ class ChopperTune:
         Returns:
             float: The calculated frequency in Hz.
         """
-        return 1 / (
-            2 * (12 + 32 * toff) * 1 / (1000000 * self.fclk)
-            + 2 * 1 / (1000000 * self.fclk) * 16 * (1.5**tbl)
-        )
+        tbl_clocks = TBL_CLOCKS.get(self.driver, DEFAULT_TBL_CLOCKS)[tbl]
+        return self.get_fclk() * 1_000_000 / (2 * (24 + 32 * toff) + 2 * tbl_clocks)
+
+    def estimate_chopper_frequency(self, toff: int) -> float:
+        """Estimate the chopper frequency the way the datasheets do.
+
+        Args:
+            toff (int): The TOFF value.
+
+        Returns:
+            float: The estimated chopper frequency in Hz.
+        """
+        slow_decay_clocks = 2 * (24 + 32 * toff)
+        return self.get_fclk() * 1_000_000 * SLOW_DECAY_DUTY / slow_decay_clocks
 
     def get_initial_direction(self, axes: list[str]) -> Coord:
         """Return the initial direction based on the axes and kinematics.
@@ -1310,6 +1468,62 @@ class ChopperTune:
             if self.reactor.monotonic() - start_time > max_wait_time:
                 self.gcode.respond_info(f"Timeout waiting for file: {data_path}")
                 break
+
+    def start_raw_capture(self, metadata: dict) -> None:
+        """Create the folder for the raw samples and save the metadata into it.
+
+        Args:
+            metadata (dict): The information needed to analyse the raw samples.
+        """
+        date_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.raw_folder = os.path.join(
+            RESULTS_FOLDER, "raw", f"{date_stamp}_{metadata['steppers'][0]}"
+        )
+        try:
+            os.makedirs(self.raw_folder, exist_ok=True)
+            with open(os.path.join(self.raw_folder, "metadata.json"), "w") as file:
+                json.dump(metadata, file, indent=4, default=str)
+        except OSError as e:
+            self.gcode.respond_info(f"WARNING!!! Not saving raw samples: {e}")
+            self.raw_folder = None
+            return
+        self.gcode.respond_info(f"Raw samples will be saved to: {self.raw_folder}")
+
+    def save_raw_samples(
+        self,
+        file_name: str,
+        samples: list[Accel_Measurement],
+        **extra: float,
+    ) -> None:
+        """Save the raw accelerometer samples, if requested.
+
+        A failure to save doesn't stop the tuning, as the samples are only for
+        offline analysis.
+
+        Args:
+            file_name (str): The file name without the extension.
+            samples (list[Accel_Measurement]): The accelerometer samples.
+            **extra (float): Other values to save with the samples.
+        """
+        if self.raw_folder is None:
+            return
+        times = np.array([sample.time for sample in samples], dtype=np.float64)
+        accel = np.array(
+            [(sample.accel_x, sample.accel_y, sample.accel_z) for sample in samples],
+            dtype=np.float32,
+        ).reshape(-1, 3)
+        start_time = times[0] if times.size else np.nan
+        try:
+            np.savez_compressed(
+                os.path.join(self.raw_folder, f"{file_name}.npz"),
+                start_time=start_time,
+                time=(times - start_time).astype(np.float32),
+                accel=accel,
+                **extra,
+            )
+        except OSError as e:
+            self.gcode.respond_info(f"WARNING!!! Stopped saving raw samples: {e}")
+            self.raw_folder = None
 
     def calc_static_acceleration_magnitude(
         self, samples: list[Accel_Measurement]
@@ -1398,6 +1612,8 @@ class ChopperTune:
         accel_chip_name: str = "default",
         run_plotter: bool = True,
         compare_with: None | str = None,
+        save_raw: bool = False,
+        toff_range_requested: bool = False,
     ) -> None | dict:
         """Measure vibrations and tune stepper motors for low noise.
 
@@ -1440,6 +1656,11 @@ class ChopperTune:
                 generated after the vibration measurements are completed.
             compare_with (None | str): The name of the previous sample set to
                 compare with.
+            save_raw (bool): If set to True, the raw accelerometer samples of each
+                measurement are saved for offline analysis.
+            toff_range_requested (bool): If set to True, the progressive search
+                tests all TOFF values from `toff_min` to `toff_max`, otherwise only
+                the ones with a recommended chopper frequency.
 
         Returns:
             None | dict: The best parameters found, or None if tuning was not
@@ -1448,6 +1669,8 @@ class ChopperTune:
         # reset previous run data
         self.reset_sample_data()
         self.reset_registers()
+        self.raw_folder = None
+        self.toff_range_requested = toff_range_requested
 
         self.search_method = search_method
 
@@ -1463,6 +1686,7 @@ class ChopperTune:
 
         self.driver, self.sense_resistor = self.detect_driver(stepper=axis)
         tpfd_min, tpfd_max = self.validate_tpfd_values(self.driver, tpfd_min, tpfd_max)
+        toff_min, toff_max = self.validate_toff_values(toff_min, toff_max)
 
         axes, steppers = self.get_axes_and_steppers(axis)
 
@@ -1502,6 +1726,10 @@ class ChopperTune:
             a_axis_max,
             acceleration,
         )
+
+        self.min_speed = min_speed
+        if self.measurement_mode == MeasurementMode.Vibrations:
+            self.validate_chopper_mode(axes, steppers)
 
         travel_distance = self.calculate_travel_distance(
             axes,
@@ -1546,6 +1774,7 @@ class ChopperTune:
             "y": Coord((b_axis_mid, a_axis_mid, home_pos.z)),
             "z": Coord((b_axis_mid, home_pos.y, a_axis_mid)),
         }[axes[0]]
+        center_position = self.initial_position
         self.initial_direction = self.get_initial_direction(axes)
         if direction == -1:
             self.initial_direction = self.initial_direction * -1
@@ -1573,6 +1802,32 @@ class ChopperTune:
         self.static_acceleration_magnitude = float(
             np.linalg.norm(self.static_acceleration_vector)
         )
+
+        if save_raw:
+            accel_chip_settings = self.settings.get(accel_chip_name, {})
+            self.start_raw_capture(
+                {
+                    "axis": axis,
+                    "kinematics": self.kinematics,
+                    "steppers": steppers,
+                    "driver": self.driver,
+                    "fclk": self.get_fclk(),
+                    "sense_resistor": self.sense_resistor,
+                    "stepper_settings": self.stepper_settings[steppers[0]],
+                    "driver_settings": self.driver_settings[steppers[0]],
+                    "accelerometer": accel_chip_name,
+                    "accelerometer_rate": accel_chip_settings.get("rate"),
+                    "measurement_mode": str(self.measurement_mode),
+                    "search_method": str(self.search_method),
+                    "iterations": self.iterations,
+                    "direction": list(self.initial_direction),
+                    "acceleration": acceleration,
+                    "travel_distance": travel_distance,
+                    "measure_time": measure_time,
+                    "static_acceleration_vector": self.static_acceleration_vector,
+                }
+            )
+            self.save_raw_samples("static", samples)
 
         # set the global start time here
         self.global_start_time = self.reactor.monotonic()
@@ -1637,7 +1892,7 @@ class ChopperTune:
             )
 
         self.toolhead.dwell(0.5)
-        self.toolhead.manual_move((a_axis_mid,), self.travel_speed)
+        self.toolhead.manual_move(center_position, self.travel_speed)
         self.toolhead.wait_moves()
         now = datetime.now().strftime("%Y%m%d_%H%M%S")
         if run_plotter:
@@ -1671,6 +1926,7 @@ class ChopperTune:
 
         # reset samples related data
         self.total_expected_samples = -1
+        self.total_expected_samples_is_max = False
         self.number_of_samples = 0
         self.number_of_real_samples = 0
         self.samples = {}
@@ -1812,7 +2068,16 @@ class ChopperTune:
             cached (bool): Whether the vibrations value is from a cached sample.
         """
         if iteration == 0:
-            if self.total_expected_samples > 0:
+            if self.total_expected_samples > 0 and self.total_expected_samples_is_max:
+                self.gcode.respond_info(
+                    f"Sample {'(cached)' if cached else '        '}: "
+                    f"{self.number_of_samples} (up to "
+                    f"{self.total_expected_samples}) | "
+                    f"E: {self.convert_seconds_to_hms(self.get_time_elapsed())} | "
+                    f"R: up to "
+                    f"{self.convert_seconds_to_hms(self.get_remaining_time())}"
+                )
+            elif self.total_expected_samples > 0:
                 percent_complete = (
                     self.number_of_samples / self.total_expected_samples
                 ) * 100
@@ -1842,6 +2107,11 @@ class ChopperTune:
         Returns:
             float: The average measured vibrations.
         """
+        # This command holds the G-Code mutex, which FIRMWARE_RESTART needs. So,
+        # stop right away after an emergency stop.
+        if self.printer.is_shutdown():
+            raise self.printer.command_error("Printer is shutdown")
+
         self.gcode.respond_info("-------------------------------")
         current, tbl, toff, hstrt, hend, tpfd, speed = [round(p) for p in params]
 
@@ -1858,6 +2128,16 @@ class ChopperTune:
             f"current={current} "
             f"speed={speed:.2f}"
         )
+
+        # As per the datasheets, TOFF=1 should only be used with TBL >= 2
+        if (
+            self.measurement_mode == MeasurementMode.Vibrations
+            and toff == 1
+            and tbl < 2
+        ):
+            self.gcode.respond_info("Penalizing toff=1 with tbl < 2: inf mm/s²")
+            self.number_of_samples += 1  # consider this as a sample
+            return float("inf")
 
         # penalize hstrt + hend > hstrt_hend_max
         if hstrt + hend > self.hstrt_hend_max:
@@ -1906,6 +2186,13 @@ class ChopperTune:
                 static_data=self.static_acceleration_vector,
             )
 
+            self.save_raw_samples(
+                f"{sample_name}_iteration={iteration + 1}",
+                samples,
+                speed=speed,
+                score=measured_vibrations,
+            )
+
             total_vibrations += measured_vibrations
             self.progress_report(measured_vibrations, iteration)
 
@@ -1926,30 +2213,131 @@ class ChopperTune:
 
         return total_vibrations
 
-    def progressive_search_loop(
+    def progressive_sweep(
         self,
-        param_min: int,
-        param_max: int,
-        param_index: int,
         best_params: list[int],
+        candidates: list[dict[int, int]],
+        preference: None | list[int] = None,
+        patience: None | int = None,
+        measure_at_least: int = 0,
     ) -> list[int]:
-        """Progressive search loop for a single parameter.
+        """Measure the given candidates and return the parameters of the picked one.
 
         Args:
-            param_min (int): The minimum value of the parameter.
-            param_max (int): The maximum value of the parameter.
-            param_index (int): The index of the parameter in the best_params list.
             best_params (list[int]): The current best parameters.
+            candidates (list[dict[int, int]]): The parameter index and value pairs
+                to change for each candidate, in measurement order.
+            preference (None | list[int]): The candidate indices from most to least
+                preferred, among the ones with similar vibrations. By default, the
+                earlier the candidate is measured, the more it is preferred.
+            patience (None | int): If given, stop after this many consecutive
+                candidates without a real improvement.
+            measure_at_least (int): The number of candidates to measure before
+                `patience` can stop the sweep.
+
+        Returns:
+            list[int]: The new best parameters, which are the same as the given
+                ones if no candidate is valid.
         """
-        best_mag = float("inf")
-        for param in range(param_min, param_max + 1):
-            best_params[param_index] = param
-            mag = self.objective_function(best_params)
-            if mag < best_mag:
-                best_mag = mag
-                best_param = param
-        best_params[param_index] = best_param
-        return best_params
+        # Taken before measuring, to compare this sweep against the earlier ones.
+        reference = self.best_result
+        scores = {}
+        lowest = float("inf")
+        stale = 0
+        for index, candidate in enumerate(candidates):
+            params = list(best_params)
+            for param_index, value in candidate.items():
+                params[param_index] = value
+            scores[index] = self.objective_function(params)
+            if scores[index] < lowest * (1 - self.plateau_tolerance):
+                stale = 0
+            else:
+                stale += 1
+            lowest = min(lowest, scores[index])
+            if (
+                patience is not None
+                and stale >= patience
+                and index + 1 >= measure_at_least
+            ):
+                break
+
+        picked = pick_preferred(
+            scores,
+            list(range(len(candidates))) if preference is None else preference,
+            self.plateau_tolerance,
+            reference,
+        )
+        if picked is None:
+            return best_params
+
+        params = list(best_params)
+        for param_index, value in candidates[picked].items():
+            params[param_index] = value
+        return params
+
+    def format_toff_values(self, toff_values: list[int]) -> str:
+        """Format TOFF values with their estimated chopper frequency.
+
+        Args:
+            toff_values (list[int]): The TOFF values.
+
+        Returns:
+            str: The values, e.g. "3 (25.0kHz), 4 (19.7kHz)".
+        """
+        return ", ".join(
+            f"{toff} ({self.estimate_chopper_frequency(toff) / 1000:.1f}kHz)"
+            for toff in toff_values
+        )
+
+    def get_progressive_toff_values(self) -> list[int]:
+        """Return the TOFF values to test, from most to least preferred.
+
+        Returns:
+            list[int]: All the requested values if the TOFF range was given by the
+                user, otherwise the ones that give an inaudible chopper frequency
+                that is not too high, or all of them if none does.
+        """
+        requested = list(range(self.toff_min, self.toff_max + 1))
+        band_min, band_max = self.min_chopper_frequency, MAX_CHOPPER_FREQ
+        band_text = f"{band_min / 1000:g}-{band_max / 1000:g}kHz"
+        in_band = [
+            toff
+            for toff in requested
+            if band_min <= self.estimate_chopper_frequency(toff) <= band_max
+        ]
+        out_of_band = [toff for toff in requested if toff not in in_band]
+        if self.toff_range_requested or not in_band:
+            values = requested
+            if out_of_band:
+                reason = (
+                    "they were requested"
+                    if self.toff_range_requested
+                    else "none of the requested values is in that band"
+                )
+                self.gcode.respond_info(
+                    f"Testing TOFF {self.format_toff_values(out_of_band)} although "
+                    f"they are outside the {band_text} chopper frequency band, as "
+                    f"{reason}. Low frequencies can cause an audible whine."
+                )
+        else:
+            values = in_band
+            if out_of_band:
+                self.gcode.respond_info(
+                    f"Skipping TOFF {self.format_toff_values(out_of_band)}, they are "
+                    f"outside the {band_text} chopper frequency band (see "
+                    "min_chopper_frequency). Set TOFF_MIN and TOFF_MAX to test "
+                    "them anyway."
+                )
+        self.gcode.respond_info(
+            f"Testing TOFF {self.format_toff_values(values)} "
+            "(estimated chopper frequency)"
+        )
+        return sorted(
+            values,
+            key=lambda toff: abs(
+                self.estimate_chopper_frequency(toff) - CHOPPER_FREQ_TARGET
+            ),
+        )
 
     def perform_brute_force_search(self) -> list[int]:
         """Perform brute-force search for optimal parameters.
@@ -2050,88 +2438,163 @@ class ChopperTune:
     def perform_progressive_search(self) -> list[int]:
         """Perform progressive search for optimal parameters.
 
+        This follows the SpreadCycle chapter of the TMC2209 and TMC5160 datasheets:
+        start from the recommended TOFF and TBL with a medium hysteresis, then
+        optimize the hysteresis. A wrong hysteresis or a too low chopper frequency
+        doesn't necessarily increase the vibrations, but does increase the chopper
+        noise that an accelerometer can not sense. So, TOFF values that give a
+        chopper frequency below `min_chopper_frequency` are not tested, and among
+        similar results, the values favored by the datasheets are used.
+
         Returns:
             list[int]: The best parameters found.
         """
         self.gcode.respond_info(
-            "Starting Progressive (Trinamic Flowchart) Optimization..."
+            "Starting Progressive (Trinamic datasheet) Optimization..."
         )
-
-        # Initial "Safe" Defaults as per Datasheet
-        best_current = self.current_min
-        best_toff = self.toff_min if self.toff_min > 0 else 3
-        best_tbl = 2
-        best_hend = self.hend_min
-        best_hstrt = self.hstrt_min
-        best_tpfd = self.tpfd_min
-        best_params = [
-            best_current,
-            best_tbl,
-            best_toff,
-            best_hstrt,
-            best_hend,
-            best_tpfd,
-            self.min_speed * 100,
-        ]
-        self.total_expected_samples = (
-            (self.toff_max - self.toff_min + 1)
-            + (self.tbl_max - self.tbl_min + 1)
-            + (self.hend_max - self.hend_min + 1)
-            + (self.hstrt_max - self.hstrt_min + 1)
-        )
-
-        # Step 1: Find optimal TOFF (Base Frequency)
-        # The datasheet suggests TOFF should be chosen for 20-50kHz.
-        # We find the one that produces the least vibration at default hysteresis.
-        self.gcode.respond_info("Step 1: Optimizing TOFF...")
-        best_params = self.progressive_search_loop(
-            param_min=self.toff_min,
-            param_max=self.toff_max,
-            param_index=2,
-            best_params=best_params,
-        )
-        self.gcode.respond_info(f"-> Best TOFF found: {best_params[2]}")
-        # Step 2: Find optimal TBL (Blank Time)
-        # Clean up the comparator signal before fine-tuning hysteresis.
-        self.gcode.respond_info("Step 2: Optimizing TBL...")
-        best_params = self.progressive_search_loop(
-            param_min=self.tbl_min,
-            param_max=self.tbl_max,
-            param_index=1,
-            best_params=best_params,
-        )
-        self.gcode.respond_info(f"-> Best TBL found: {best_params[1]}")
-        # Step 3: Find optimal HEND (Hysteresis End / Low-side)
-        # Flowchart: Start with HSTRT=0, increase HEND until smooth.
-        self.gcode.respond_info("Step 3: Optimizing HEND...")
-        best_params = self.progressive_search_loop(
-            param_min=self.hend_min,
-            param_max=self.hend_max,
-            param_index=4,
-            best_params=best_params,
-        )
-        self.gcode.respond_info(f"-> Best HEND found: {best_params[4]}")
-        # Step 4: Find optimal HSTRT (Hysteresis Start / High-side)
-        # Flowchart: Use best HEND, increase HSTRT to fine-tune the zero-crossing.
-        self.gcode.respond_info("Step 4: Optimizing HSTRT...")
-        best_params = self.progressive_search_loop(
-            param_min=self.hstrt_min,
-            param_max=self.hstrt_max,
-            param_index=3,
-            best_params=best_params,
-        )
-        self.gcode.respond_info(f"-> Best HSTRT found: {best_params[3]}")
-
-        # Finally search for TPFD if applicable
-        if self.driver in DRIVERS_SUPPORTING_TPFD:
-            self.gcode.respond_info("Step 5: Optimizing TPFD...")
-            best_params = self.progressive_search_loop(
-                param_min=self.tpfd_min,
-                param_max=self.tpfd_max,
-                param_index=5,
-                best_params=best_params,
+        if self.min_speed != self.max_speed:
+            self.gcode.respond_info(
+                f"Progressive search uses a single speed: {self.min_speed:.2f} mm/s, "
+                "ignoring MAX_SPEED."
             )
-            self.gcode.respond_info(f"-> Best TPFD found: {best_params[5]}")
+        if self.current_min != self.current_max:
+            self.gcode.respond_info(
+                f"Progressive search uses a single current: {self.current_min} mA, "
+                "ignoring CURRENT_MAX_MA."
+            )
+
+        toff_values = self.get_progressive_toff_values()
+        tbl_values = [
+            tbl
+            for tbl in range(self.tbl_min, self.tbl_max + 1)
+            if tbl in RECOMMENDED_TBL
+        ] or list(range(self.tbl_min, self.tbl_max + 1))
+        tbl_values.sort(key=lambda tbl: abs(tbl - DEFAULT_TBL))
+
+        # Start with the recommended values, within the requested limits.
+        start_hstrt = self.hstrt_min
+        start_hend = min(
+            max(
+                DEFAULT_EFFECTIVE_HYSTERESIS + HYSTERESIS_REGISTER_OFFSET - start_hstrt,
+                self.hend_min,
+            ),
+            self.hend_max,
+        )
+        best_params = [
+            self.current_min,
+            tbl_values[0],
+            toff_values[0],
+            start_hstrt,
+            start_hend,
+            self.tpfd_min,
+            round(self.min_speed * 100),
+        ]
+        hend_values = list(range(self.hend_min, self.hend_max + 1))
+        hstrt_values = list(range(self.hstrt_min, self.hstrt_max + 1))
+        tpfd_values = list(range(self.tpfd_min, self.tpfd_max + 1))
+        self.total_expected_samples = (
+            2 * len(toff_values)
+            + len(tbl_values)
+            + len(hend_values)
+            + len(hstrt_values)
+            + (len(tpfd_values) if self.driver in DRIVERS_SUPPORTING_TPFD else 0)
+        )
+        # Sweeps stop early when there is no improvement.
+        self.total_expected_samples_is_max = True
+
+        def sweep_toff(params: list[int]) -> list[int]:
+            ascending = sorted(toff_values)
+            return self.progressive_sweep(
+                params,
+                [{PARAM_TOFF: toff} for toff in ascending],
+                preference=[ascending.index(toff) for toff in toff_values],
+            )
+
+        # Step 1: TOFF sets the upper limit of the chopper frequency.
+        self.gcode.respond_info("Step 1: Optimizing TOFF...")
+        best_params = sweep_toff(best_params)
+        self.gcode.respond_info(
+            f"-> Best TOFF found: {self.format_toff_values([best_params[PARAM_TOFF]])}"
+        )
+
+        # Step 2: TBL needs to safely cover the switching event and the ringing.
+        self.gcode.respond_info("Step 2: Optimizing TBL...")
+        ascending_tbl = sorted(tbl_values)
+        best_params = self.progressive_sweep(
+            best_params,
+            [{PARAM_TBL: tbl} for tbl in ascending_tbl],
+            preference=[ascending_tbl.index(tbl) for tbl in tbl_values],
+        )
+        self.gcode.respond_info(f"-> Best TBL found: {best_params[PARAM_TBL]}")
+
+        # Step 3: Increase the hysteresis until the motor runs smoothly. A too low
+        # value reduces the microstep accuracy, and a too high value increases the
+        # chopper noise without improving the wave shape. Neither is necessarily
+        # sensed by an accelerometer, so the datasheet default is preferred over
+        # similar results, and the sweep doesn't stop before measuring it.
+        self.gcode.respond_info("Step 3: Optimizing the hysteresis...")
+        hstrt = best_params[PARAM_HSTRT]
+
+        def hysteresis_of(hend: int) -> int:
+            return hstrt + hend - HYSTERESIS_REGISTER_OFFSET
+
+        hysteresis_preference = sorted(
+            range(len(hend_values)),
+            key=lambda index: (
+                abs(hysteresis_of(hend_values[index]) - DEFAULT_EFFECTIVE_HYSTERESIS),
+                hend_values[index],
+            ),
+        )
+        best_params = self.progressive_sweep(
+            best_params,
+            [{PARAM_HEND: hend} for hend in hend_values],
+            preference=hysteresis_preference,
+            patience=PROGRESSIVE_PATIENCE,
+            measure_at_least=hysteresis_preference[0] + 1,
+        )
+        self.gcode.respond_info(
+            f"-> Best HEND found: {best_params[PARAM_HEND]} (effective hysteresis: "
+            f"{hysteresis_of(best_params[PARAM_HEND])})"
+        )
+
+        # Step 4: Split the same hysteresis start value between HSTRT and HEND. A
+        # lower HEND gives more hysteresis decrement, which stabilizes the chopper
+        # frequency.
+        self.gcode.respond_info("Step 4: Optimizing the HSTRT and HEND split...")
+        register_sum = best_params[PARAM_HSTRT] + best_params[PARAM_HEND]
+        splits = [
+            {PARAM_HSTRT: hstrt, PARAM_HEND: register_sum - hstrt}
+            for hstrt in hstrt_values
+            if self.hend_min <= register_sum - hstrt <= self.hend_max
+        ]
+        best_params = self.progressive_sweep(
+            best_params,
+            splits,
+            preference=list(reversed(range(len(splits)))),
+        )
+        self.gcode.respond_info(
+            f"-> Best HSTRT found: {best_params[PARAM_HSTRT]}, "
+            f"HEND: {best_params[PARAM_HEND]}"
+        )
+
+        # Step 5: The optimum hysteresis and TOFF depend on each other, so check
+        # TOFF again with the final hysteresis.
+        self.gcode.respond_info("Step 5: Checking TOFF with the final hysteresis...")
+        best_params = sweep_toff(best_params)
+        self.gcode.respond_info(
+            f"-> Best TOFF found: {self.format_toff_values([best_params[PARAM_TOFF]])}"
+        )
+
+        # Step 6: "Starting from 0, increase value, in case the motor suffers from
+        # mid-range resonances."
+        if self.driver in DRIVERS_SUPPORTING_TPFD:
+            self.gcode.respond_info("Step 6: Optimizing TPFD...")
+            best_params = self.progressive_sweep(
+                best_params,
+                [{PARAM_TPFD: tpfd} for tpfd in tpfd_values],
+                patience=PROGRESSIVE_PATIENCE,
+            )
+            self.gcode.respond_info(f"-> Best TPFD found: {best_params[PARAM_TPFD]}")
 
         return best_params
 
@@ -2161,7 +2624,11 @@ class ChopperTune:
 
         # set initial values
         self.apply_registers(self.steppers, "curr", self.current_min)
-        self.apply_registers(self.steppers, "tbl", self.tbl_min)
+        initial_tbl = self.tbl_min
+        if self.measurement_mode == MeasurementMode.Vibrations and self.toff_min == 1:
+            # TOFF=1 should only be used with TBL >= 2
+            initial_tbl = max(initial_tbl, min(2, self.tbl_max))
+        self.apply_registers(self.steppers, "tbl", initial_tbl)
         self.apply_registers(self.steppers, "toff", self.toff_min)
         self.apply_registers(self.steppers, "hend", self.hend_min)
         self.apply_registers(self.steppers, "hstrt", self.hstrt_min)
@@ -2186,11 +2653,15 @@ class ChopperTune:
         }
 
         duration = self.reactor.monotonic() - start_time
+        selected_score = self.samples.get(
+            self.generate_sample_name(**overall_best_params), float("inf")
+        )
 
         result_message = (
             f"Optimization Completed in {self.convert_seconds_to_hms(duration)}\n"
             f"Number of samples : {self.number_of_samples}\n"
-            f"Best Score        : {self.best_result:.1f} mm/s²\n\n"
+            f"Lowest Score      : {self.best_result:.1f} mm/s²\n"
+            f"Selected Score    : {selected_score:.1f} mm/s²\n\n"
             "Parameters\n"
             "----------\n"
             f"speed        : {overall_best_params['speed']:.2f} mm/s\n"
@@ -2235,7 +2706,7 @@ class ChopperTune:
                     continue  # skip tpfd for unsupported drivers and if the value is -1
 
                 field_name = f"driver_{field}" if field != "current" else "run_current"
-                value = str(value) if field != "current" else f"{value / 1000:0.2f}"
+                value = str(value) if field != "current" else f"{value / 1000:0.3f}"
 
                 self.configfile.set(
                     f"tmc{self.driver} {self.steppers[0]}{stepper_index}",
@@ -2330,29 +2801,24 @@ class ChopperTune:
             f"_{self.sense_resistor}"
             ".json",
         )
+        os.makedirs(RESULTS_FOLDER, exist_ok=True)
         with open(json_path, mode="w") as file:
             json.dump(self.samples, file, indent=4)
         self.gcode.respond_info(f"Sample data saved to: {json_path}")
 
-    def cmd_chopper_tune(self, gcmd: GCodeCommand) -> bool:
-        """Tune stepper values.
-
-        Args:
-            gcmd (GCodeCommand): The G-Code command.
-
-        Returns:
-            bool: True if command completed successfully, False otherwise.
-        """
-        self.reactor.register_callback(
-            lambda e: self.parse_args_and_run_optimization(gcmd)
-        )
-        return True
-
-    def parse_args_and_run_optimization(self, gcmd: GCodeCommand) -> None:
+    def cmd_chopper_tune(self, gcmd: GCodeCommand) -> None:
         """Collect data from G-Code command and run optimization.
 
+        This runs as a regular G-Code command, so it holds the G-Code mutex until
+        it is done and the following commands wait for it. Emergency stop still
+        works immediately as it doesn't need the mutex, the same as with the other
+        long running Klipper commands.
+
         Args:
             gcmd (GCodeCommand): The G-Code command.
+
+        Raises:
+            CommandError: If the tuning fails.
         """
         try:
             axis = gcmd.get("AXIS", "x").lower()
@@ -2365,8 +2831,13 @@ class ChopperTune:
             current_max = gcmd.get_float("CURRENT_MAX_MA", None)
             tbl_min = gcmd.get_int("TBL_MIN", DEFAULT_REGISTER_VALUES["TBL"][0])
             tbl_max = gcmd.get_int("TBL_MAX", DEFAULT_REGISTER_VALUES["TBL"][1])
-            toff_min = gcmd.get_int("TOFF_MIN", DEFAULT_REGISTER_VALUES["TOFF"][0])
-            toff_max = gcmd.get_int("TOFF_MAX", DEFAULT_REGISTER_VALUES["TOFF"][1])
+            toff_min = gcmd.get_int("TOFF_MIN", None)
+            toff_max = gcmd.get_int("TOFF_MAX", None)
+            toff_range_requested = toff_min is not None or toff_max is not None
+            if toff_min is None:
+                toff_min = DEFAULT_REGISTER_VALUES["TOFF"][0]
+            if toff_max is None:
+                toff_max = DEFAULT_REGISTER_VALUES["TOFF"][1]
             hstrt_hend_max = gcmd.get_int(
                 "HSTRT_HEND_MAX", DEFAULT_REGISTER_VALUES["HSTRT_HEND_MAX"]
             )
@@ -2398,8 +2869,9 @@ class ChopperTune:
                 "false": False,
                 "true": True,
             }.get(gcmd.get("RUN_PLOTTER", "true").lower(), True)
+            save_raw = gcmd.get("SAVE_RAW", "false").lower() in ("1", "true")
 
-            return self.chopper_tune(
+            self.chopper_tune(
                 axis=axis,
                 current_min=current_min,
                 current_max=current_max,
@@ -2423,9 +2895,16 @@ class ChopperTune:
                 accel_chip_name=accel_chip_name,
                 run_plotter=run_plotter,
                 compare_with=compare_with,
+                save_raw=save_raw,
+                toff_range_requested=toff_range_requested,
             )
+        except self.printer.command_error:
+            raise
         except Exception as e:
+            # Klipper shuts down on any exception other than a command error. A
+            # problem in this tool shouldn't do that.
             self.gcode.respond_info(traceback.format_exc())
+            raise self.printer.command_error(f"Chopper tune failed: {e}") from e
 
     def cmd_chopper_tune_debug(self, gcmd: GCodeCommand) -> bool:
         """Development debug tool.
@@ -2440,8 +2919,8 @@ class ChopperTune:
             self.gcode.respond_info(f"x stepper count: {self.get_stepper_count('x')}")
             self.gcode.respond_info(f"y stepper count: {self.get_stepper_count('y')}")
             self.gcode.respond_info(f"z stepper count: {self.get_stepper_count('z')}")
-        except Exception as e:
-            self.gcode.respond_info(traceback.format_exc(e))
+        except Exception:
+            self.gcode.respond_info(traceback.format_exc())
 
 
 def load_config(config: ConfigWrapper) -> ChopperTune:

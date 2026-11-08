@@ -1,7 +1,7 @@
 ### The method of semi-automatic calibration of driver parameters is based on Trinamic’s [manual](https://www.analog.com/en/app-notes/AN-001.html) for “behavioral” motor tuning.
 
 
-### 1. Install the calibration script on the printer host. (the klipper will reboot!)
+1. Install the calibration script on the printer host. (the klipper will reboot!)
 
 ```shell
    cd ~
@@ -9,7 +9,7 @@
    bash ~/chopper-resonance-tuner/install.sh
 ```
 
-If everything went well, you will see folder - `adxl_results` in your printer
+If everything went well, you will see folder - `chopper_magnitude` in your printer
 home directory (~/printer_data/config), into which the calibration results will
 be placed, as well as an already available macro from the macro panel on the
 main page of the Fluidd / Mainsail.
@@ -39,7 +39,7 @@ And if for some reason not, then install [manually](/wiki/manual_install_en.md).
 
    2. After the macro is completed, the algorithm will report the speed that
       has the maximum resonances and automatically generate a table of data and
-      graphics, place them in the `.../adxl_results/chopper_magnitude/`
+      graphics, place them in the `.../chopper_magnitude/`
       directory, download and open `{date}_interactive_plot_*.html`, and see the
       following picture:
 
@@ -175,13 +175,50 @@ minimum required ones.
 11. `SEARCH_METHOD`
 
    The iteration method to use when looking for the next values for chopper
-   parameters. Defaults to `brute_force`. Adaptive uses an adaptive optimization
-   algorithm which generally works ~10-20x faster in finding the smallest
-   vibration parameters. Values: `brute_force / bruteforce / adaptive`.
+   parameters. Defaults to `progressive`. Values:
+   `progressive / adaptive / brute_force / bruteforce`.
+
+   - `progressive` follows the SpreadCycle chapter of the TMC datasheets. An
+     accelerometer can't sense the chopper noise, so it relies on the datasheet
+     for that:
+     - By default it only tests the `TOFF` values with an estimated chopper
+       frequency between `min_chopper_frequency` (22 kHz by default) and 35 kHz,
+       and lists the skipped ones with their estimated frequency. A lower
+       chopper frequency can give less vibration but an audible whine,
+       especially when the motor is standing still. If `TOFF_MIN` or `TOFF_MAX`
+       is given, it tests the whole `TOFF` range.
+     - It tests the recommended `TBL` values of 1 and 2, limited by the
+       requested ranges.
+     - It optimizes the hysteresis, preferring the datasheet default of an
+       effective hysteresis of 4.
+     - Results within `plateau_tolerance` (5% by default) are treated as equal
+       and the value favored by the datasheet is used, e.g. the `TOFF` closest to
+       a 25 kHz chopper frequency.
+     - Each step stops early when the results stop improving, so the sample
+       count it shows is a maximum.
+     - It uses `MIN_SPEED` and `CURRENT_MIN_MA` only.
+
+     To check for a chopper whine, listen to the motor while it is standing
+     still with the new values.
+   - `adaptive` uses an adaptive optimization algorithm which generally works
+     ~10-20x faster than `brute_force` in finding the smallest vibration
+     parameters.
+   - `brute_force` tests all the combinations.
+
+   Chopper parameters have no effect in StealthChop, so tuning stops with an error
+   if `stealthchop_threshold` would keep the driver in StealthChop at the
+   measurement speed.
 
 12. `RUN_PLOTTER`
 
    Run the graph generation script. Values - `(True / False), (1 / 0)`
+
+13. `SAVE_RAW`
+
+   Save the raw accelerometer data of every measurement, for offline analysis,
+   into `chopper_magnitude/raw/{date}_{stepper}/`: one compressed `.npz` file per
+   measurement plus a `metadata.json`. A full `brute_force` run is around 150 MB.
+   Values - `(True / False), (1 / 0)`, defaults to `False`.
 
 
 ### About Core XY Printers

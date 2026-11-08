@@ -1,7 +1,7 @@
 1. Create a folder for the output files, by default:
 
    ```shell
-   mkdir ~/printer_data/config/adxl_results/chopper_magnitude
+   mkdir -p ~/printer_data/config/chopper_magnitude
    ```
 
 2. Download a program:
